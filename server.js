@@ -12,7 +12,7 @@ const upload = multer({
   limits: { fileSize: 150 * 1024 * 1024 } // 150MB per file
 });
 
-const ANTHROPIC_KEY = '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';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 const PROXY_URL = 'https://takeoffproxy.zach-c19.workers.dev';
 
 app.use(cors());
