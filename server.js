@@ -1,15 +1,12 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const pdfParse = require('pdf-parse');
-const sharp = require('sharp');
-const { fromBuffer } = require('pdf2pic');
 const fetch = require('node-fetch');
 
 const app = express();
 const upload = multer({ 
   storage: multer.memoryStorage(),
-  limits: { fileSize: 150 * 1024 * 1024 } // 150MB per file
+  limits: { fileSize: 150 * 1024 * 1024 }
 });
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
@@ -18,12 +15,10 @@ const PROXY_URL = 'https://takeoffproxy.zach-c19.workers.dev';
 app.use(cors());
 app.use(express.json({ limit: '200mb' }));
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'Takeoff Mobile server running', version: '1.0.0' });
+  res.json({ status: 'Takeoff Mobile server running', version: '2.0.0' });
 });
 
-// Main takeoff endpoint
 app.post('/takeoff', upload.fields([
   { name: 'pdfs', maxCount: 10 },
   { name: 'dwgs', maxCount: 10 }
@@ -31,65 +26,13 @@ app.post('/takeoff', upload.fields([
   try {
     const { jobName, gc, eng, options } = req.body;
     const pdfFiles = req.files?.pdfs || [];
-    const dwgFiles = req.files?.dwgs || [];
 
     if (!pdfFiles.length) {
       return res.status(400).json({ error: 'No PDF files uploaded' });
     }
 
-    console.log(`Processing takeoff: ${jobName} - ${pdfFiles.length} PDFs, ${dwgFiles.length} DWGs`);
+    console.log(`Processing takeoff: ${jobName} - ${pdfFiles.length} PDFs`);
 
-    // Step 1: Extract text from PDFs
-    let extractedText = '';
-    const imageBuffers = [];
-
-    for (const file of pdfFiles) {
-      try {
-        console.log(`Parsing PDF: ${file.originalname} (${Math.round(file.size/1024/1024*10)/10}MB)`);
-        
-        // Extract text
-        const parsed = await pdfParse(file.buffer);
-        extractedText += `\n\n=== FILE: ${file.originalname} ===\n${parsed.text}`;
-
-        // Convert key pages to images (pages 1-6, covers most grading sets)
-        const converter = fromBuffer(file.buffer, {
-          density: 150,           // DPI - good quality without huge size
-          saveFilename: 'page',
-          savePath: '/tmp',
-          format: 'jpeg',
-          width: 1400,
-          height: 1000,
-          quality: 70
-        });
-
-        const pageCount = Math.min(parsed.numpages, 6);
-        for (let i = 1; i <= pageCount; i++) {
-          try {
-            const result = await converter(i, { responseType: 'buffer' });
-            if (result?.buffer) {
-              // Compress further with sharp
-              const compressed = await sharp(result.buffer)
-                .jpeg({ quality: 65, progressive: true })
-                .toBuffer();
-              imageBuffers.push({
-                name: file.originalname,
-                page: i,
-                data: compressed.toString('base64')
-              });
-              console.log(`  Page ${i}: ${Math.round(compressed.length/1024)}KB`);
-            }
-          } catch(pageErr) {
-            console.warn(`  Could not render page ${i}:`, pageErr.message);
-          }
-        }
-      } catch(pdfErr) {
-        console.warn(`Could not process ${file.originalname}:`, pdfErr.message);
-        // Still include filename in text even if parsing fails
-        extractedText += `\n\n=== FILE: ${file.originalname} (could not parse) ===`;
-      }
-    }
-
-    // Step 2: Build Claude message with text + images
     const checkedOptions = options ? JSON.parse(options) : [
       'Earthwork (cut, fill, net export)',
       'Pavement sections (HD/LD asphalt)',
@@ -99,49 +42,47 @@ app.post('/takeoff', upload.fields([
 
     const contentBlocks = [];
 
-    // Add images first (Claude reads images before text)
-    for (const img of imageBuffers) {
+    for (const file of pdfFiles.slice(0, 5)) {
+      console.log(`Attaching PDF: ${file.originalname} (${Math.round(file.size/1024/1024*10)/10}MB)`);
       contentBlocks.push({
-        type: 'image',
+        type: 'document',
         source: {
           type: 'base64',
-          media_type: 'image/jpeg',
-          data: img.data
+          media_type: 'application/pdf',
+          data: file.buffer.toString('base64')
         }
       });
     }
 
-    // Add extracted text
-    if (extractedText.trim()) {
-      contentBlocks.push({
-        type: 'text',
-        text: `EXTRACTED TEXT FROM PLAN SHEETS:\n${extractedText.slice(0, 15000)}` // Cap at 15k chars
-      });
-    }
-
-    // Add the prompt
     contentBlocks.push({
       type: 'text',
       text: `You are an expert earthwork and civil construction estimator with 20+ years of experience.
 
-Analyze these construction plan sheets for: "${jobName}" (GC: ${gc || 'unknown'}, Engineer: ${eng || 'unknown'})
+Analyze the attached PDF documents for job: "${jobName}" (GC: ${gc || 'unknown'}, Engineer: ${eng || 'unknown'})
 
-CALCULATE: ${checkedOptions.join(', ')}
+IMPORTANT: Extract EXACT numbers directly from the documents. Do NOT estimate or guess — read the actual values printed in the plans, volume reports, quantity tables, or notes.
 
-INSTRUCTIONS:
-- Read finish floor elevations (FFE) from the plans
-- Read existing and proposed contour lines to determine cut/fill
-- Read building footprint SF from labels on plans
-- Read pavement legend (HD asphalt, LD asphalt, concrete pavement areas)
-- Look for grading notes, stripping depths (typically 6")
-- Use scale bar to estimate areas not labeled
-- Building pad SF is often labeled directly on the building footprint
-- Site acreage is often in the legal description or title block
-- Truck loads = net CY divided by 10 CY per load
+If this is a volume report (like an Agtek or similar report), read the exact totals from the summary table.
+If these are plan sheets, read the quantities from the grading plans, quantity tables, and notes.
 
-Use actual numbers from the plans wherever visible. Make professional estimates where not shown.
+EXTRACT THESE ITEMS: ${checkedOptions.join(', ')}
 
-Respond ONLY with this exact JSON structure — no markdown, no explanation:
+READ THESE SPECIFIC VALUES:
+- Cut CY: total cut cubic yards from the volume summary
+- Fill CY: total fill cubic yards from the volume summary
+- Net CY: absolute difference between cut and fill
+- Site type: "export" if cut > fill, "import" if fill > cut
+- Stripping CY: topsoil stripping volume (often labeled "site strip" or "stripping")
+- HD Asphalt SY: heavy duty asphalt area in square yards
+- LD Asphalt SY: light duty asphalt area in square yards
+- Concrete pavement SY: concrete pavement area in square yards
+- Concrete walks SF: sidewalk/walk area in square feet
+- Building pad CY: building pad cut/fill volume
+- Building pad SF: total building footprint square footage
+- Site acres: total site area in acres (divide total SF by 43,560)
+- FFE: finish floor elevation(s)
+
+Respond ONLY with this exact JSON — no markdown, no explanation, exact numbers only:
 
 {
   "siteAcres": <number>,
@@ -157,14 +98,11 @@ Respond ONLY with this exact JSON structure — no markdown, no explanation:
   "concretePaveSY": <number>,
   "concreteWalksSF": <number>,
   "buildingPadCY": <number>,
-  "notes": "<key observations string>",
-  "confidence": "<'high', 'medium', or 'low'>"
+  "notes": "<what documents were found and key observations>",
+  "confidence": "<'high' if exact numbers found, 'medium' if some estimated, 'low' if mostly estimated>"
 }`
     });
 
-    console.log(`Sending to Claude: ${imageBuffers.length} images + ${Math.round(extractedText.length/1000)}KB text`);
-
-    // Step 3: Call Claude via Cloudflare proxy
     const claudeResponse = await fetch(PROXY_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
