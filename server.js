@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 const upload = multer({ 
@@ -10,13 +11,12 @@ const upload = multer({
 });
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
-const PROXY_URL = 'https://takeoffproxy.zach-c19.workers.dev';
 
 app.use(cors());
 app.use(express.json({ limit: '200mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'Takeoff Mobile server running', version: '2.0.0' });
+  res.json({ status: 'Takeoff Mobile server running', version: '3.0.0' });
 });
 
 app.post('/takeoff', upload.fields([
@@ -40,49 +40,50 @@ app.post('/takeoff', upload.fields([
       'Stripping and topsoil'
     ];
 
-    const contentBlocks = [];
-
-    for (const file of pdfFiles.slice(0, 5)) {
-      console.log(`Attaching PDF: ${file.originalname} (${Math.round(file.size/1024/1024*10)/10}MB)`);
-      contentBlocks.push({
-        type: 'document',
-        source: {
-          type: 'base64',
-          media_type: 'application/pdf',
-          data: file.buffer.toString('base64')
-        }
-      });
+    // Extract text from all PDFs
+    let extractedText = '';
+    for (const file of pdfFiles) {
+      try {
+        console.log(`Extracting text from: ${file.originalname}`);
+        const parsed = await pdfParse(file.buffer);
+        extractedText += `\n\n=== FILE: ${file.originalname} ===\n${parsed.text}`;
+        console.log(`  Extracted ${parsed.text.length} characters`);
+      } catch(e) {
+        console.warn(`Could not parse ${file.originalname}:`, e.message);
+        extractedText += `\n\n=== FILE: ${file.originalname} (could not parse) ===`;
+      }
     }
 
-    contentBlocks.push({
-      type: 'text',
-      text: `You are an expert earthwork and civil construction estimator with 20+ years of experience.
+    const prompt = `You are an expert earthwork and civil construction estimator with 20+ years of experience.
 
-Analyze the attached PDF documents for job: "${jobName}" (GC: ${gc || 'unknown'}, Engineer: ${eng || 'unknown'})
+Analyze the following extracted text from construction documents for job: "${jobName}" (GC: ${gc || 'unknown'}, Engineer: ${eng || 'unknown'})
 
-IMPORTANT: Extract EXACT numbers directly from the documents. Do NOT estimate or guess — read the actual values printed in the plans, volume reports, quantity tables, or notes.
+IMPORTANT: Extract EXACT numbers directly from the text. Do NOT estimate — read the actual values from the volume reports, quantity tables, and notes.
 
-If this is a volume report (like an Agtek or similar report), read the exact totals from the summary table.
-If these are plan sheets, read the quantities from the grading plans, quantity tables, and notes.
+If this is a volume report (Agtek, Carlson, etc.), read the exact totals from the summary table.
+If these are plan sheets, read quantities from quantity tables and grading notes.
 
 EXTRACT THESE ITEMS: ${checkedOptions.join(', ')}
 
 READ THESE SPECIFIC VALUES:
-- Cut CY: total cut cubic yards from the volume summary
+- Cut CY: total cut cubic yards from the volume summary (look for "Regions Total" or similar)
 - Fill CY: total fill cubic yards from the volume summary
 - Net CY: absolute difference between cut and fill
 - Site type: "export" if cut > fill, "import" if fill > cut
-- Stripping CY: topsoil stripping volume (often labeled "site strip" or "stripping")
-- HD Asphalt SY: heavy duty asphalt area in square yards
-- LD Asphalt SY: light duty asphalt area in square yards
-- Concrete pavement SY: concrete pavement area in square yards
-- Concrete walks SF: sidewalk/walk area in square feet
-- Building pad CY: building pad cut/fill volume
-- Building pad SF: total building footprint square footage
-- Site acres: total site area in acres (divide total SF by 43,560)
-- FFE: finish floor elevation(s)
+- Stripping CY: topsoil stripping volume (look for "Site Strip" or "Stripping")
+- HD Asphalt SY: heavy duty asphalt in square yards (look for "HD" rows)
+- LD Asphalt SY: light duty asphalt in square yards (look for "LD" rows)
+- Concrete pavement SY: concrete pavement in square yards
+- Concrete walks SF: sidewalk area in square feet (look for "Walk" rows, convert SY to SF by x9)
+- Building pad CY: building pad volume (look for "Building 5", "Building 6" etc.)
+- Building pad SF: total building footprint SF (sum all building areas)
+- Site acres: total site area (divide total SF by 43,560)
+- FFE: finish floor elevation(s) if shown
 
-Respond ONLY with this exact JSON — no markdown, no explanation, exact numbers only:
+EXTRACTED DOCUMENT TEXT:
+${extractedText}
+
+Respond ONLY with this exact JSON — no markdown, no explanation:
 
 {
   "siteAcres": <number>,
@@ -98,22 +99,23 @@ Respond ONLY with this exact JSON — no markdown, no explanation, exact numbers
   "concretePaveSY": <number>,
   "concreteWalksSF": <number>,
   "buildingPadCY": <number>,
-  "notes": "<what documents were found and key observations>",
+  "notes": "<key observations>",
   "confidence": "<'high' if exact numbers found, 'medium' if some estimated, 'low' if mostly estimated>"
-}`
-    });
+}`;
 
-   const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    console.log(`Sending ${extractedText.length} characters of text to Claude...`);
+
+    const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
-  'Content-Type': 'application/json',
-  'x-api-key': ANTHROPIC_KEY,
-  'anthropic-version': '2023-06-01',
-},
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+      },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1500,
-        messages: [{ role: 'user', content: contentBlocks }]
+        messages: [{ role: 'user', content: prompt }]
       })
     });
 
