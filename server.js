@@ -321,5 +321,71 @@ Extract EVERY number and specification that affects earthwork bidding. Return ON
   }
 });
 
+// ─── 8. QUANTITY READER (Agtek / STACK PDF auto-fill) ────────────────
+app.post('/read-quantities', upload.single('pdf'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    console.log(`Reading quantities from: ${req.file.originalname}`);
+    const text = await extractText(req.file.buffer, req.file.originalname);
+
+    const prompt = `You are an expert earthwork estimator reading a takeoff software report (Agtek, STACK, Earthworks, or similar).
+
+Extract every quantity from this document. Read EXACT numbers — do not estimate.
+
+DOCUMENT TEXT:
+${text.slice(0, 20000)}
+
+Look for:
+- Job name, project name, or site name
+- General contractor / owner name
+- Engineer or design firm
+- Bid due date
+- Cut cubic yards (CY) — may be labeled "Cut", "Excavation", "Earth Cut"
+- Fill cubic yards (CY) — may be labeled "Fill", "Embankment", "Earth Fill"
+- Net CY — difference between cut and fill (positive number)
+- Site type — "export" if cut > fill, "import" if fill > cut
+- Stripping CY — topsoil stripping volume
+- HD Asphalt SY — heavy duty asphalt pavement square yards
+- LD Asphalt SY — light duty asphalt pavement square yards
+- Concrete pavement SY
+- Concrete walks or flatwork SF
+- Building pad SF and/or CY
+- Site acres
+- Finish floor elevation (FFE)
+- Any notes or scope qualifications
+
+Return ONLY this JSON — no markdown, no explanation:
+{
+  "jobName": "<project name or empty string>",
+  "gc": "<GC or owner name or empty string>",
+  "eng": "<engineer or empty string>",
+  "dueDate": "<bid due date or empty string>",
+  "siteType": "<'export' or 'import'>",
+  "cutCY": <number or 0>,
+  "fillCY": <number or 0>,
+  "netCY": <number or 0>,
+  "strippingCY": <number or 0>,
+  "hdAsphaltSY": <number or 0>,
+  "ldAsphaltSY": <number or 0>,
+  "concretePaveSY": <number or 0>,
+  "concreteWalksSF": <number or 0>,
+  "buildingPadSF": <number or 0>,
+  "buildingPadCY": <number or 0>,
+  "siteAcres": <number or 0>,
+  "ffe": "<FFE value or empty string>",
+  "notes": "<any scope notes, assumptions, or qualifications found in the document>",
+  "confidence": "<'high' if quantities clearly labeled, 'medium' if inferred, 'low' if document unclear>"
+}`;
+
+    const raw = await callClaude([{ role: 'user', content: prompt }], 1000);
+    const quantities = JSON.parse(raw.replace(/```json|```/g, '').trim());
+    console.log(`Quantities read from ${req.file.originalname}:`, quantities);
+    res.json({ success: true, quantities });
+  } catch(err) {
+    console.error('Read quantities error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Takeoff Mobile server v3.0 running on port ${PORT}`));
